@@ -1,11 +1,11 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-
+import (
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -23,7 +23,6 @@ func ihash(key string) int {
 
 var coordSockName string // socket for coordinator
 
-
 // main/mrworker.go calls this function.
 func Worker(sockname string, mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
@@ -33,34 +32,20 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
-}
-
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+	arg := ReqTaskArgs{}
+	reply := ReqTaskReply{}
+	if !call("Coordinator.GetTask", &arg, &reply) {
+		log.Fatalf("call failed!")
+	}
+	content, err := os.ReadFile(reply.FileName)
+	if err != nil {
+		log.Fatalf("cannot read %v", reply.FileName)
+	}
+	kvs := mapf(reply.FileName, string(content))
+	buckets := make([][]KeyValue, reply.nReduce)
+	for _, kv := range kvs {
+		bucket := ihash(kv.Key) % reply.nReduce
+		buckets[bucket] = append(buckets[bucket], kv)
 	}
 }
 
