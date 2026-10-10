@@ -10,14 +10,16 @@ type ReqTaskArgs struct {
 }
 
 type ReqTaskReply struct {
+	Attempts int
 	TaskId   int
-	nReduce  int
-	nMap     int
+	NReduce  int
+	NMap     int
 	FileName string
 	TaskType string
 }
 
 type ReportTaskArgs struct {
+	Attempts   int
 	TaskId     int
 	TaskStatus string
 }

@@ -7,6 +7,7 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 type Coordinator struct {
@@ -15,8 +16,12 @@ type Coordinator struct {
 	files            []string
 	mapTaskStatus    map[int]string
 	reduceTaskStatus map[int]string
-	MapCompleted     int
-	ReduceCompleted  int
+	mapTaskStart     map[int]time.Time
+	reduceTaskStart  map[int]time.Time
+	mapAttempts      map[int]int
+	reduceAttempts   map[int]int
+	mapCompleted     int
+	reduceCompleted  int
 	nMap             int
 	nReduce          int
 	phase            string
@@ -28,26 +33,42 @@ func (c *Coordinator) GetTask(args *ReqTaskArgs, reply *ReqTaskReply) error {
 	defer c.mutex.Unlock()
 	if c.phase == "map" {
 		for taskid, filename := range c.files {
-			if c.mapTaskStatus[taskid] == "" {
+			expired := c.mapTaskStart[taskid].Add(10*time.Second).Before(time.Now()) && c.mapTaskStatus[taskid] == "assigned"
+			if c.mapTaskStatus[taskid] == "" || expired { // 任务未分配或者超时
+				c.mapAttempts[taskid]++
+				reply.Attempts = c.mapAttempts[taskid]
 				reply.TaskId = taskid
 				reply.FileName = filename
 				reply.TaskType = "map"
-				reply.nReduce = c.nReduce
+				reply.NReduce = c.nReduce
 				c.mapTaskStatus[taskid] = "assigned"
+				c.mapTaskStart[taskid] = time.Now()
 				return nil
 			}
 		}
+		reply.TaskType = "wait"
+		return nil
 	}
 	if c.phase == "reduce" {
 		for taskid := 0; taskid < c.nReduce; taskid++ {
-			if c.reduceTaskStatus[taskid] == "" {
+			expired := c.reduceTaskStart[taskid].Add(10*time.Second).Before(time.Now()) && c.reduceTaskStatus[taskid] == "assigned"
+			if c.reduceTaskStatus[taskid] == "" || expired { // 任务未分配或者超时
+				c.reduceAttempts[taskid]++
+				reply.Attempts = c.reduceAttempts[taskid]
 				reply.TaskId = taskid
-				reply.nMap = c.nMap
+				reply.NMap = c.nMap
 				reply.TaskType = "reduce"
 				c.reduceTaskStatus[taskid] = "assigned"
+				c.reduceTaskStart[taskid] = time.Now()
 				return nil
 			}
 		}
+		reply.TaskType = "wait"
+		return nil
+	}
+	if c.phase == "done" {
+		reply.TaskType = "done"
+		return nil
 	}
 	return nil
 }
@@ -56,7 +77,7 @@ func (c *Coordinator) ReportMapTask(args *ReportTaskArgs, reply *ReqTaskReply) e
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	status, ok := c.mapTaskStatus[args.TaskId]
-	if !ok || status != "assigned" {
+	if !ok || status != "assigned" || c.mapAttempts[args.TaskId] != args.Attempts { // 任务不存在或者不是assigned状态或者尝试次数不匹配
 		return nil
 	}
 	if args.TaskStatus == "completed" {
@@ -69,8 +90,8 @@ func (c *Coordinator) ReportMapTask(args *ReportTaskArgs, reply *ReqTaskReply) e
 		}
 		c.phase = "reduce"
 		*/
-		c.MapCompleted++
-		if c.MapCompleted == c.nMap {
+		c.mapCompleted++
+		if c.mapCompleted == c.nMap {
 			c.phase = "reduce"
 		}
 	} else {
@@ -83,12 +104,12 @@ func (c *Coordinator) ReportReduceTask(args *ReportTaskArgs, reply *ReqTaskReply
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	status, ok := c.reduceTaskStatus[args.TaskId]
-	if !ok || status != "assigned" {
+	if !ok || status != "assigned" || c.reduceAttempts[args.TaskId] != args.Attempts { // 任务不存在或者不是assigned状态或者尝试次数不匹配
 		return nil
 	}
 	if args.TaskStatus == "completed" {
 		c.reduceTaskStatus[args.TaskId] = "completed"
-		c.ReduceCompleted++
+		c.reduceCompleted++
 	} else {
 		c.reduceTaskStatus[args.TaskId] = ""
 	}
@@ -110,12 +131,13 @@ func (c *Coordinator) server(sockname string) {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-
-	if c.phase == "reduce" && c.ReduceCompleted == c.nReduce {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if c.phase == "reduce" && c.reduceCompleted == c.nReduce {
+		c.phase = "done"
 		return true
 	}
-
-	return false
+	return c.phase == "done"
 }
 
 // create a Coordinator.
@@ -127,6 +149,10 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 		nReduce:          nReduce,
 		mapTaskStatus:    make(map[int]string),
 		reduceTaskStatus: make(map[int]string),
+		mapTaskStart:     make(map[int]time.Time),
+		reduceTaskStart:  make(map[int]time.Time),
+		mapAttempts:      make(map[int]int),
+		reduceAttempts:   make(map[int]int),
 		nMap:             len(files),
 		phase:            "map",
 	}

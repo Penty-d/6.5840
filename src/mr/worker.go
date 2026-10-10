@@ -9,6 +9,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -36,107 +37,138 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the coordinator.
-	arg := ReqTaskArgs{}
-	reply := ReqTaskReply{}
-	if !call("Coordinator.GetTask", &arg, &reply) {
-		log.Fatalf("call failed!") // call不到就不再call了
-	}
-	if reply.TaskType == "map" {
-		content, err := os.ReadFile(reply.FileName)
-		if err != nil {
-			call("Coordinator.ReportMapTask", &ReportTaskArgs{TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
-			log.Fatalf("cannot read %v", reply.FileName)
+	for {
+		arg := ReqTaskArgs{}
+		reply := ReqTaskReply{}
+		if !call("Coordinator.GetTask", &arg, &reply) {
+			log.Fatalf("call failed!") // call不到就不再call了
 		}
-		kvs := mapf(reply.FileName, string(content))
-		buckets := make([][]KeyValue, reply.nReduce)
-		for _, kv := range kvs {
-			bucket := ihash(kv.Key) % reply.nReduce
-			buckets[bucket] = append(buckets[bucket], kv)
+		if reply.TaskType == "wait" {
+			time.Sleep(200 * time.Millisecond)
+			continue
 		}
-		for i, bucket := range buckets {
-			if len(bucket) == 0 {
-				continue
-			}
-			// 这里使用临时文件是因为coordinator需要超时重连，对于超时的worker，reduce可能读到错误信息
-			tmpFile, err := os.CreateTemp("", "mr-tmp-*")
+		if reply.TaskType == "done" {
+			break
+		}
+		if reply.TaskType == "map" {
+			content, err := os.ReadFile(reply.FileName)
 			if err != nil {
-				call("Coordinator.ReportMapTask", &ReportTaskArgs{TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
-				log.Fatalf("cannot create temp file: %v", err)
+				call("Coordinator.ReportMapTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+				log.Fatalf("cannot read %v", reply.FileName)
 			}
-			enc := json.NewEncoder(tmpFile)
-			for _, kv := range bucket {
-				if err := enc.Encode(&kv); err != nil {
-					call("Coordinator.ReportMapTask", &ReportTaskArgs{TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
-					log.Fatalf("cannot encode kv: %v", err)
+			kvs := mapf(reply.FileName, string(content))
+			buckets := make([][]KeyValue, reply.NReduce)
+			for _, kv := range kvs {
+				bucket := ihash(kv.Key) % reply.NReduce
+				buckets[bucket] = append(buckets[bucket], kv)
+			}
+			for i, bucket := range buckets {
+				if len(bucket) == 0 {
+					tmf, err := os.Create(fmt.Sprintf("mr-%d-%d", reply.TaskId, i))
+					if err != nil {
+						call("Coordinator.ReportMapTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+						log.Fatalf("cannot create temp file: %v", err)
+					}
+					if err := tmf.Close(); err != nil {
+						call("Coordinator.ReportMapTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+						log.Fatalf("cannot close temp file: %v", err)
+					}
+					continue
 				}
-			}
-			outFileName := fmt.Sprintf("mr-%d-%d", reply.TaskId, i)
-			tmpFile.Close()
-			if err := os.Rename(tmpFile.Name(), outFileName); err != nil {
-				call("Coordinator.ReportMapTask", &ReportTaskArgs{TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
-				log.Fatalf("cannot rename temp file: %v", err)
-			}
-		}
-		call("Coordinator.ReportMapTask", &ReportTaskArgs{TaskId: reply.TaskId, TaskStatus: "completed"}, &ReqTaskReply{})
-	} else if reply.TaskType == "reduce" {
-		intermediate := []KeyValue{}
-		for i := 0; i < reply.nMap; i++ {
-			fileName := fmt.Sprintf("mr-%d-%d", i, reply.TaskId)
-			file, err := os.Open(fileName)
-			if err != nil {
-				call("Coordinator.ReportReduceTask", &ReportTaskArgs{TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
-				log.Fatalf("cannot open %v", fileName)
-			}
-			dec := json.NewDecoder(file)
-			for {
-				var kv KeyValue
-				err := dec.Decode(&kv)
-				if err == io.EOF {
-					break
-				}
+				// 这里使用临时文件是因为coordinator需要超时重连，对于超时的worker，reduce可能读到错误信息
+				tmpFile, err := os.CreateTemp(".", "mr-tmp-*")
 				if err != nil {
-					call("Coordinator.ReportReduceTask", &ReportTaskArgs{TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
-					log.Fatalf("cannot decode kv: %v", err)
+					call("Coordinator.ReportMapTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+					log.Fatalf("cannot create temp file: %v", err)
 				}
-				intermediate = append(intermediate, kv)
+				enc := json.NewEncoder(tmpFile)
+				for _, kv := range bucket {
+					if err := enc.Encode(&kv); err != nil {
+						call("Coordinator.ReportMapTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+						log.Fatalf("cannot encode kv: %v", err)
+					}
+				}
+				outFileName := fmt.Sprintf("mr-%d-%d", reply.TaskId, i)
+				if err := tmpFile.Close(); err != nil {
+					call("Coordinator.ReportMapTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+					log.Fatalf("cannot close temp file: %v", err)
+				}
+				if err := os.Rename(tmpFile.Name(), outFileName); err != nil {
+					call("Coordinator.ReportMapTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+					log.Fatalf("cannot rename temp file: %v", err)
+				}
 			}
-			sort.Slice(intermediate, func(i, j int) bool {
+			if err := call("Coordinator.ReportMapTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "completed"}, &ReqTaskReply{}); !err {
+				log.Fatalf("report map task failed")
+			}
+		}
+		if reply.TaskType == "reduce" {
+			intermediate := []KeyValue{}
+			for i := 0; i < reply.NMap; i++ { //收集对应r的所有map输出
+				fileName := fmt.Sprintf("mr-%d-%d", i, reply.TaskId)
+				file, err := os.Open(fileName)
+				if err != nil {
+					call("Coordinator.ReportReduceTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+					log.Fatalf("cannot open %v", fileName)
+				}
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					err := dec.Decode(&kv)
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						call("Coordinator.ReportReduceTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+						log.Fatalf("cannot decode kv: %v", err)
+					}
+					intermediate = append(intermediate, kv)
+				}
+				if err := file.Close(); err != nil {
+					call("Coordinator.ReportReduceTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+					log.Fatalf("cannot close input file: %v", err)
+				}
+			}
+			sort.Slice(intermediate, func(i, j int) bool { //按key排序
 				return intermediate[i].Key < intermediate[j].Key
 			})
 
-			tmpFile, err := os.CreateTemp("", "mr-rd-tmp-*")
+			tmpFile, err := os.CreateTemp(".", "mr-rd-tmp-*")
 			if err != nil {
-				call("Coordinator.ReportReduceTask", &ReportTaskArgs{TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+				call("Coordinator.ReportReduceTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
 				log.Fatalf("cannot create temp file: %v", err)
 			}
 
 			for i := 0; i < len(intermediate); {
 				j := i + 1
-				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key { // 找到相同key的所有kv
 					j++
 				}
-				i = j
 				values := make([]string, 0, j-i)
-				for k := i - (j - i); k < j; k++ {
-					values = append(values, intermediate[k].Value)
+				for k := i; k < j; k++ {
+					values = append(values, intermediate[k].Value) // 收集相同key的所有value
 				}
 				output := reducef(intermediate[i].Key, values)
 				if _, err := fmt.Fprintf(tmpFile, "%v %v\n", intermediate[i].Key, output); err != nil {
-					call("Coordinator.ReportReduceTask", &ReportTaskArgs{TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+					call("Coordinator.ReportReduceTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
 					log.Fatalf("cannot write to temp file: %v", err)
 				}
 				i = j
+
+			}
+			if err := tmpFile.Close(); err != nil {
+				call("Coordinator.ReportReduceTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+				log.Fatalf("cannot close temp file: %v", err)
 			}
 			if err := os.Rename(tmpFile.Name(), fmt.Sprintf("mr-out-%d", reply.TaskId)); err != nil {
-				call("Coordinator.ReportReduceTask", &ReportTaskArgs{TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
+				call("Coordinator.ReportReduceTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "failed"}, &ReqTaskReply{})
 				log.Fatalf("cannot rename temp file: %v", err)
 			}
-			tmpFile.Close()
-			os.Remove(fileName)
-			call("Coordinator.ReportReduceTask", &ReportTaskArgs{TaskId: reply.TaskId, TaskStatus: "completed"}, &ReqTaskReply{})
+			if err := call("Coordinator.ReportReduceTask", &ReportTaskArgs{Attempts: reply.Attempts, TaskId: reply.TaskId, TaskStatus: "completed"}, &ReqTaskReply{}); !err {
+				log.Fatalf("report reduce task failed")
+			}
 		}
 	}
-
 }
 
 // send an RPC request to the coordinator, wait for the response.
