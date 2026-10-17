@@ -7,7 +7,6 @@ package raft
 // In addition,  Make() creates a new raft peer that implements the
 // raft interface.
 
-
 import (
 	//	"bytes"
 	"math/rand"
@@ -17,9 +16,8 @@ import (
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
-
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -27,6 +25,12 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *tester.Persister   // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
+
+	//3A
+	role          string      // 该服务的角色，follewer、candidate、leader
+	currentTerm   int         // 当前任期号
+	votedFor      int         // 当前任期内投票给了谁
+	electionTimer *time.Timer // 选举计时器
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
@@ -41,6 +45,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (3A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	isleader = rf.role == "leader"
 	return term, isleader
 }
 
@@ -61,7 +69,6 @@ func (rf *Raft) persist() {
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
 }
-
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
@@ -90,7 +97,6 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -100,22 +106,46 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term        int
+	CandidateId int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.currentTerm < args.Term { // 如果请求的任期号大于当前任期号，说明自己落后了
+		rf.currentTerm = args.Term
+		rf.role = "follower"
+		rf.votedFor = -1
+		reply.VoteGranted = false
+	}
+	if rf.currentTerm == args.Term { // 如果请求的任期号等于当前任期号
+		if rf.votedFor == -1 || rf.votedFor == args.CandidateId { // 如果自己还没有投票，或者已经投票给了请求者
+			rf.votedFor = args.CandidateId
+			reply.VoteGranted = true
+			ms := 400 + (rand.Int63() % 300)                             // 400-700ms
+			rf.electionTimer.Reset(time.Duration(ms) * time.Millisecond) // 重置选举计时器
+		} else { // 如果自己已经投票给了其他人
+			reply.VoteGranted = false
+		}
+	} else { // 如果请求的任期号小于当前任期号
+		reply.VoteGranted = false
+	}
+	reply.Term = rf.currentTerm
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -145,11 +175,152 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
+
+type HeartBeatArgs struct {
+	Term int
+}
+
+type HeartBeatReply struct {
+	Term int
+}
+
+func (rf *Raft) HeartBeat(args *HeartBeatArgs, reply *HeartBeatReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.currentTerm > args.Term {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	rf.role = "follower"
+
+	if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+
+	reply.Term = rf.currentTerm
+	ms := 400 + (rand.Int63() % 300)                             // 400-700ms
+	rf.electionTimer.Reset(time.Duration(ms) * time.Millisecond) // 重置选举计时器
+}
+
+func (rf *Raft) sendHeartBeat(term int) {
+	for {
+		rf.mu.Lock()
+
+		if rf.role != "leader" || rf.currentTerm != term {
+			rf.mu.Unlock()
+			return
+		}
+
+		args := &HeartBeatArgs{
+			Term: rf.currentTerm,
+		}
+
+		rf.mu.Unlock()
+
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			reply := &HeartBeatReply{}
+			go func(server int, args *HeartBeatArgs) {
+				if !rf.peers[server].Call("Raft.HeartBeat", args, reply) {
+					return
+				}
+
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.role = "follower"
+					rf.votedFor = -1
+					ms := 400 + (rand.Int63() % 300)
+					rf.electionTimer.Reset(time.Duration(ms) * time.Millisecond) // 重置选举计时器
+				}
+			}(i, args)
+		}
+		time.Sleep(100 * time.Millisecond) // 发送心跳间隔
+	}
+}
+
+func (rf *Raft) StartElection() {
+	rf.mu.Lock()
+
+	if rf.role == "leader" { // 如果自己是leader，就不需要发起选举
+		rf.mu.Unlock()
+		return
+	}
+
+	rf.role = "candidate"
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	rf.electionTimer.Reset(time.Duration(400+rand.Int63()%300) * time.Millisecond)
+	tickets := 1
+	term := rf.currentTerm // 后续在for中其他rf可能会改term
+
+	if tickets > len(rf.peers)/2 { // 单节点情况
+		rf.role = "leader"
+		go rf.sendHeartBeat(rf.currentTerm)
+		rf.mu.Unlock()
+		return
+	}
+
+	rf.mu.Unlock()
+
+	for i := 0; i < len(rf.peers); i++ {
+
+		if i == rf.me {
+			continue
+		}
+
+		args := &RequestVoteArgs{
+			Term:        term,
+			CandidateId: rf.me,
+		}
+		reply := &RequestVoteReply{}
+
+		go func(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+
+			ok := rf.sendRequestVote(server, args, reply)
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if ok {
+
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.role = "follower"
+					rf.votedFor = -1
+					ms := 400 + (rand.Int63() % 300)
+					rf.electionTimer.Reset(time.Duration(ms) * time.Millisecond) // 重置选举计时器
+				}
+
+				if rf.currentTerm != term || rf.role != "candidate" {
+					return
+				}
+
+				if reply.VoteGranted {
+
+					tickets++
+					if tickets > len(rf.peers)/2 {
+						rf.role = "leader"
+						go rf.sendHeartBeat(rf.currentTerm)
+						return
+					}
+				}
+
+			}
+		}(i, args, reply)
+	}
+}
+
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
-
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -169,21 +340,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 
-
 	return index, term, isLeader
 }
 
 func (rf *Raft) ticker() {
-	for true {
+	for { // true有啥用……
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
 
-
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+
+		<-rf.electionTimer.C
+		rf.StartElection()
 	}
 }
 
@@ -203,14 +373,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	ms := 400 + (rand.Int63() % 300) // 400-700ms
+	rf.electionTimer = time.NewTimer(time.Duration(ms) * time.Millisecond)
 	// Your initialization code here (3A, 3B, 3C).
+	//3A
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.role = "follower"
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
