@@ -9,11 +9,13 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -66,35 +68,36 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
-func (rf *Raft) persist() {
+func (rf *Raft) persist() { // 持锁
 	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(rf.currentTerm) != nil ||
+		e.Encode(rf.votedFor) != nil ||
+		e.Encode(rf.logEntries) != nil {
+		panic("encode error")
+	}
+	rf.persister.Save(w.Bytes(), nil)
 }
 
 // restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte) { // 持锁
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
 	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term, votedFor int
+	var entries []LogEntry // 消除一下 warning
+	if d.Decode(&term) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&entries) != nil {
+		panic("decode error")
+	}
+	rf.currentTerm = term
+	rf.votedFor = votedFor
+	rf.logEntries = entries
 }
 
 // how many bytes in Raft's persisted log?
@@ -146,6 +149,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.role = "follower"
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	reply.Term = rf.currentTerm
@@ -161,6 +165,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
+			rf.persist()
 			ms := 400 + (rand.Int63() % 300)                             // 400-700ms
 			rf.electionTimer.Reset(time.Duration(ms) * time.Millisecond) // 重置选举计时器
 
@@ -205,8 +210,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictTerm  int // 冲突日志的任期 3C中fail了，为了快速恢复添加的字段
+	ConflictIndex int // 冲突日志的索引
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -225,6 +232,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	reply.Term = rf.currentTerm
@@ -232,10 +240,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.electionTimer.Reset(time.Duration(ms) * time.Millisecond) // 重置选举计时器
 
 	if args.PrevLogIndex >= len(rf.logEntries) {
-		return // 没有该索引
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = len(rf.logEntries) // 3C中fail了，为了快速恢复添加的字段
+		return                                   // 没有该索引
 	}
 
 	if args.PrevLogTerm != rf.logEntries[args.PrevLogIndex].Term {
+		reply.ConflictTerm = rf.logEntries[args.PrevLogIndex].Term
+		index := args.PrevLogIndex
+		for index > 0 && rf.logEntries[index-1].Term == reply.ConflictTerm {
+			index--
+		}
+		reply.ConflictIndex = index
 		return // 任期不同
 	}
 
@@ -243,10 +259,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		index := args.PrevLogIndex + 1 + i
 		if index >= len(rf.logEntries) { // 如果没有该索引，说明后续是新的日志，直接追加
 			rf.logEntries = append(rf.logEntries, args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 		if rf.logEntries[index].Term != entry.Term { // 如果任期不同，说明日志不一致，需要删除后续日志
 			rf.logEntries = append(rf.logEntries[:index], args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 	}
@@ -301,6 +319,7 @@ func (rf *Raft) sendHeartBeat(term int) {
 					rf.currentTerm = reply.Term
 					rf.role = "follower"
 					rf.votedFor = -1
+					rf.persist()
 					ms := 400 + (rand.Int63() % 300)
 					rf.electionTimer.Reset(time.Duration(ms) * time.Millisecond) // 重置选举计时器
 				}
@@ -313,10 +332,25 @@ func (rf *Raft) sendHeartBeat(term int) {
 					rf.matchIndex[server] = max(rf.matchIndex[server], args.PrevLogIndex+len(args.Entries)) // 用max防止回退
 					rf.nextIndex[server] = max(rf.nextIndex[server], rf.matchIndex[server]+1)
 					rf.VerifyCommitted()
-				} else if rf.nextIndex[server] == args.PrevLogIndex+1 && rf.nextIndex[server] > rf.matchIndex[server]+1 { // 如果失败了，说明日志不一致，需要回退
-					rf.nextIndex[server] = max(1, rf.nextIndex[server]-1) // 防止回退到0
-				}
+				} else if rf.nextIndex[server] == args.PrevLogIndex+1 &&
+					rf.nextIndex[server] > rf.matchIndex[server]+1 { //防nextindex被已经修改，且确保还有回退空间
 
+					newNext := reply.ConflictIndex
+
+					if reply.ConflictTerm != -1 {
+						for i := len(rf.logEntries) - 1; i >= 1; i-- {
+							if rf.logEntries[i].Term == reply.ConflictTerm {
+								newNext = i + 1
+								break
+							}
+						}
+					}
+
+					rf.nextIndex[server] = max(1, max(newNext, rf.matchIndex[server]+1))
+				}
+				/*else if rf.nextIndex[server] == args.PrevLogIndex+1 && rf.nextIndex[server] > rf.matchIndex[server]+1 { // 如果失败了，说明日志不一致，需要回退
+					rf.nextIndex[server] = max(1, rf.nextIndex[server]-1) // 防止回退到0
+				}*/
 			}(i, args)
 		}
 		time.Sleep(100 * time.Millisecond) // 发送心跳间隔
@@ -343,6 +377,7 @@ func (rf *Raft) StartElection() {
 	rf.role = "candidate"
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.electionTimer.Reset(time.Duration(400+rand.Int63()%300) * time.Millisecond)
 	tickets := 1
 	term := rf.currentTerm // 后续在for中其他rf可能会改term
@@ -386,6 +421,7 @@ func (rf *Raft) StartElection() {
 					rf.currentTerm = reply.Term
 					rf.role = "follower"
 					rf.votedFor = -1
+					rf.persist()
 					ms := 400 + (rand.Int63() % 300)
 					rf.electionTimer.Reset(time.Duration(ms) * time.Millisecond) // 重置选举计时器
 				}
@@ -472,6 +508,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	index = len(rf.logEntries)
 	rf.logEntries = append(rf.logEntries, LogEntry{Command: command, Term: term})
+	rf.persist()
 	rf.matchIndex[rf.me] = index
 	rf.nextIndex[rf.me] = index + 1
 	rf.VerifyCommitted()
